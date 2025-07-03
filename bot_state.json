@@ -1,0 +1,52 @@
+{
+    "BTC/USDT": {
+        "bot_in_position": false,
+        "current_position_type": null,
+        "entry_price": null,
+        "stop_loss_price": null,
+        "take_profit_prices": {},
+        "tp_levels_hit": {
+            "TP1": false,
+            "TP2": false,
+            "TP3": false
+        },
+        "last_atr_for_sl_tp": null,
+        "original_stop_loss_price": null
+    },
+    "ETH/USDT": {
+        "bot_in_position": true,
+        "current_position_type": "LONG",
+        "entry_price": 2596.99,
+        "stop_loss_price": 2596.99,
+        "take_profit_prices": {
+            "TP1": 2601.7825752115236,
+            "TP2": 2606.5751504230475,
+            "TP3": 2611.367725634571
+        },
+        "tp_levels_hit": {
+            "TP1": true,
+            "TP2": false,
+            "TP3": false
+        },
+        "last_atr_for_sl_tp": 4.792575211523746,
+        "original_stop_loss_price": 2589.8011371827142
+    },
+    "BNB/USDT": {
+        "bot_in_position": true,
+        "current_position_type": "LONG",
+        "entry_price": 662.68,
+        "stop_loss_price": 662.68,
+        "take_profit_prices": {
+            "TP1": 663.1534261220145,
+            "TP2": 663.6268522440291,
+            "TP3": 664.1002783660437
+        },
+        "tp_levels_hit": {
+            "TP1": true,
+            "TP2": false,
+            "TP3": false
+        },
+        "last_atr_for_sl_tp": 0.47342612201458334,
+        "original_stop_loss_price": 661.9698608169781
+    }
+}

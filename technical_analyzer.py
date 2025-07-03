@@ -4,64 +4,203 @@ import pandas as pd
 import pandas_ta as ta
 import time
 import datetime
-import numpy as np 
+import numpy as np
+import logging
+import json
+import os
 
-# --- НАСТРОЙКИ БОТА ---
-SYMBOL = 'BTC/USDT'     # Торговая пара
-TIMEFRAME = '15m'       # Таймфрейм
-EXCHANGE = ccxt.binance() # Выбираем биржу Binance
+# --- НАСТРОЙКИ ЛОГИРОВАНИЯ ---
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
-# Интервал мониторинга в секундах.
-MONITORING_INTERVAL_SECONDS = 300 # 5 минут
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
+
+file_handler = logging.FileHandler('bot_log.log')
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+# --- ФАЙЛЫ КОНФИГУРАЦИИ И СОСТОЯНИЯ БОТА ---
+CONFIG_FILE = 'config.json'
+STATE_FILE = 'bot_state.json'
+
+# --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ (будут загружены из конфига или инициализированы) ---
+SYMBOLS = []
+TIMEFRAME = '5m'
+MONITORING_INTERVAL_SECONDS = 60
+EXCHANGE = ccxt.binance() 
 
 # --- НАСТРОЙКИ СТРАТЕГИИ: SL, TP, ATR ---
-ATR_LENGTH = 14 # Длина для расчета Average True Range
+ATR_LENGTH = 14
 
-# Коэффициенты для SL и TP на основе ATR
-SL_MULTIPLIER = 1.5      # Стоп-лосс на 1.5 ATR от точки входа
-TP1_MULTIPLIER = 1.0     # Первый тейк-профит на 1.0 ATR
-TP2_MULTIPLIER = 2.0     # Второй тейк-профит на 2.0 ATR
-TP3_MULTIPLIER = 3.0     # Третий тейк-профит на 3.0 ATR
+SL_MULTIPLIER = 1.5
+TP1_MULTIPLIER = 1.0
+TP2_MULTIPLIER = 2.0
+TP3_MULTIPLIER = 3.0
 
-# --- НОВЫЕ НАСТРОЙКИ СТРАТЕГИИ: MACD и Bollinger Bands ---
+# --- НАСТРОЙКИ СТРАТЕГИИ: MACD и Bollinger Bands ---
 MACD_FAST_LENGTH = 12
 MACD_SLOW_LENGTH = 26
 MACD_SIGNAL_LENGTH = 9
 
 BB_LENGTH = 20
-BB_MULTIPLIER = 2.0 # Количество стандартных отклонений
-
-# --- НАСТРОЙКИ УПРАВЛЕНИЯ ПОЗИЦИЕЙ ---
-# Trailing Stop:
-# Когда цена движется в нашу сторону, стоп-лосс подтягивается
-TRAILING_STOP_PERCENTAGE = 0.5 # Процент от движения цены в нашу сторону, на который подтягивается SL (от ATR или от % цены)
-                               # Для простоты, пока используем ATR_MULTIPLIER, но можно сделать % от цены
-
-# Break-Even Stop:
-# Перевод стоп-лосса в безубыток после достижения TP1
-ENABLE_BREAK_EVEN_STOP = True
+BB_MULTIPLIER = 2.0
 
 # Примерная ожидаемая длительность движения в свечах (на основе таймфрейма)
-EXPECTED_MOVE_CANDLES_MIN = 2
-EXPECTED_MOVE_CANDLES_MAX = 4
+EXPECTED_MOVE_CANDLES_MIN = 3
+EXPECTED_MOVE_CANDLES_MAX = 6
 
-# --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ СОСТОЯНИЯ БОТА ---
-bot_in_position = False 
-current_position_type = None
-entry_price = None
-stop_loss_price = None
-take_profit_prices = {}
-tp_levels_hit = {'TP1': False, 'TP2': False, 'TP3': False} 
-# Для Trailing Stop
-last_atr_for_sl_tp = None # Сохраняем ATR на момент входа для расчета SL/TP
-original_stop_loss_price = None # Для Break-Even Stop
+# --- ГЛОБАЛЬНАЯ ПЕРЕМЕННАЯ СОСТОЯНИЯ БОТА ---
+bot_state = {}
+
+# --- ФУНКЦИИ ДЛЯ УПРАВЛЕНИЯ КОНФИГУРАЦИЕЙ И СОСТОЯНИЕМ ---
+def load_config():
+    """Загружает настройки бота из JSON файла конфигурации."""
+    global SYMBOLS, TIMEFRAME, MONITORING_INTERVAL_SECONDS
+
+    if not os.path.exists(CONFIG_FILE):
+        logger.error(f"Файл конфигурации '{CONFIG_FILE}' не найден. Создайте его с необходимыми настройками.")
+        # Создаем дефолтный конфиг, если его нет
+        default_config = {
+            "symbols": [
+                'BTC/USDT',
+                'ETH/USDT',
+                'BNB/USDT'
+            ],
+            "timeframe": "5m",
+            "monitoring_interval_seconds": 60
+        }
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(default_config, f, indent=4)
+        logger.info(f"Создан дефолтный файл конфигурации '{CONFIG_FILE}'. Пожалуйста, отредактируйте его.")
+        exit()
+
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            config = json.load(f)
+
+        SYMBOLS = config.get('symbols', [])
+        TIMEFRAME = config.get('timeframe', '5m')
+        MONITORING_INTERVAL_SECONDS = config.get('monitoring_interval_seconds', 60)
+
+        if not SYMBOLS:
+            logger.error(f"Список символов в '{CONFIG_FILE}' пуст. Пожалуйста, укажите символы для торговли.")
+            exit()
+
+        logger.info(f"Настройки бота успешно загружены из '{CONFIG_FILE}'.")
+        logger.info(f"  Символы: {SYMBOLS}")
+        logger.info(f"  Таймфрейм: {TIMEFRAME}")
+        logger.info(f"  Интервал мониторинга: {MONITORING_INTERVAL_SECONDS} сек.")
+
+    except json.JSONDecodeError as e:
+        logger.critical(f"Ошибка декодирования JSON из файла конфигурации '{CONFIG_FILE}': {e}. Проверьте синтаксис JSON.", exc_info=True)
+        exit()
+    except Exception as e:
+        logger.critical(f"Неизвестная ошибка при загрузке конфигурации из '{CONFIG_FILE}': {e}", exc_info=True)
+        exit()
+
+
+def initialize_pair_state(symbol):
+    """Инициализирует или сбрасывает состояние для конкретной торговой пары."""
+    return {
+        'bot_in_position': False,
+        'current_position_type': None,
+        'entry_price': None,
+        'stop_loss_price': None,
+        'take_profit_prices': {},
+        'tp_levels_hit': {'TP1': False, 'TP2': False, 'TP3': False},
+        'last_atr_for_sl_tp': None,
+        'original_stop_loss_price': None, 
+    }
+
+def save_bot_state():
+    """Сохраняет текущее состояние бота (для всех пар) в JSON файл."""
+    try:
+        # Сохраняем только те символы, которые есть в текущем списке SYMBOLS
+        state_to_save = {s: bot_state[s] for s in SYMBOLS if s in bot_state}
+        with open(STATE_FILE, 'w') as f:
+            json.dump(state_to_save, f, indent=4)
+        logger.info(f"Состояние бота успешно сохранено в {STATE_FILE}")
+    except Exception as e:
+        logger.error(f"Ошибка при сохранении состояния бота в {STATE_FILE}: {e}", exc_info=True)
+
+def load_bot_state():
+    """Загружает состояние бота (для всех пар) из JSON файла."""
+    global bot_state
+
+    if not os.path.exists(STATE_FILE):
+        logger.info(f"Файл состояния {STATE_FILE} не найден. Запуск с начальным состоянием для каждой пары.")
+        # Инициализируем состояние только для символов из текущего конфига
+        for symbol in SYMBOLS:
+            bot_state[symbol] = initialize_pair_state(symbol)
+        return
+
+    try:
+        with open(STATE_FILE, 'r') as f:
+            loaded_state = json.load(f)
+
+        new_bot_state = {}
+        # Проходим по символам из текущего конфига
+        for symbol in SYMBOLS:
+            if symbol in loaded_state:
+                new_bot_state[symbol] = loaded_state[symbol]
+                # Добавляем новые поля, если они появились в initialize_pair_state
+                default_state = initialize_pair_state(symbol)
+                for key, value in default_state.items():
+                    if key not in new_bot_state[symbol]:
+                        new_bot_state[symbol][key] = value
+            else:
+                # Если символ новый, инициализируем его состояние
+                new_bot_state[symbol] = initialize_pair_state(symbol)
+
+        bot_state = new_bot_state
+
+        logger.info(f"Состояние бота успешно загружено из {STATE_FILE}")
+        for symbol, state in bot_state.items():
+            pos_info = f"Позиция {'открыта' if state['bot_in_position'] else 'нет'}, Тип: {state['current_position_type']}, Цена входа: {state['entry_price']:.8f}" if state['entry_price'] else "без активной позиции."
+            logger.info(f"  Загруженное состояние для {symbol}: {pos_info}")
+
+    except json.JSONDecodeError as e:
+        logger.error(f"Ошибка декодирования JSON из файла состояния {STATE_FILE}: {e}. Файл может быть поврежден. Запуск с начальным состоянием для каждой пары.", exc_info=True)
+        bot_state = {} # Сбрасываем все
+        for symbol in SYMBOLS: # Инициализируем только для текущих символов
+            bot_state[symbol] = initialize_pair_state(symbol)
+    except Exception as e:
+        logger.error(f"Неизвестная ошибка при загрузке состояния бота из {STATE_FILE}: {e}. Запуск с начальным состоянием для каждой пары.", exc_info=True)
+        bot_state = {} # Сбрасываем все
+        for symbol in SYMBOLS: # Инициализируем только для текущих символов
+            bot_state[symbol] = initialize_pair_state(symbol)
+
+# --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ПОВТОРНЫХ ПОПЫТОК ---
+def retry_on_exception(func, retries=3, delay=1, backoff=2):
+    """
+    Выполняет функцию с повторными попытками при возникновении определенных исключений.
+    """
+    for i in range(retries):
+        try:
+            return func()
+        except (ccxt.NetworkError, ccxt.ExchangeNotAvailable, ccxt.RequestTimeout,
+                ccxt.DDoSProtection, ccxt.ExchangeError) as e:
+            logger.warning(f"Ошибка биржи (попытка {i + 1}/{retries}): {e}. Повторная попытка через {delay:.1f} сек...")
+            time.sleep(delay)
+            delay *= backoff
+        except Exception as e:
+            logger.error(f"Неизвестная ошибка (попытка {i + 1}/{retries}): {e}. Повторная попытка через {delay:.1f} сек...", exc_info=True)
+            time.sleep(delay)
+            delay *= backoff
+    raise Exception(f"Все {retries} попыток исчерпаны. Не удалось выполнить функцию {func.__name__}.")
+
 
 def calculate_atr_manually(df, length=14):
     """
     Расчет Average True Range (ATR) вручную.
-    Использует экспоненциальное скользящее среднее (EMA) для сглаживания True Range.
     """
-    if len(df) < length + 1: 
+    if len(df) < length + 1:
         df[f'ATR_{length}'] = np.nan
         return df
 
@@ -76,354 +215,318 @@ def calculate_atr_manually(df, length=14):
     df.drop('TR', axis=1, inplace=True)
     return df
 
-def fetch_data():
-    """Загружает исторические данные (свечи) с биржи."""
-    try:
-        ohlcv = EXCHANGE.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=600) 
+def fetch_data(symbol):
+    """Загружает исторические данные (свечи) для конкретной пары с биржи с повторными попытками."""
+    def _fetch():
+        logger.debug(f"[{symbol}] Запрос OHLCV данных для {symbol} с лимитом {1000} на таймфрейме {TIMEFRAME}...")
+        ohlcv = EXCHANGE.fetch_ohlcv(symbol, TIMEFRAME, limit=1000)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
+        logger.debug(f"[{symbol}] Получено {len(df)} свечей. Последняя свеча: {df.iloc[-1]['timestamp']} Close: {df.iloc[-1]['close']:.8f}")
         return df
+
+    try:
+        return retry_on_exception(_fetch, retries=5, delay=2)
     except Exception as e:
-        print(f"Произошла ошибка при загрузке данных: {e}")
+        logger.critical(f"[{symbol}] Критическая ошибка: Не удалось получить данные для {symbol} после нескольких попыток: {e}", exc_info=True)
         return None
 
-def add_indicators(df):
+def add_indicators(df, symbol):
     """Добавляет технические индикаторы в DataFrame."""
     if df.empty:
-        print("add_indicators: Входной DataFrame пуст.")
+        logger.warning(f"[{symbol}] add_indicators: Входной DataFrame пуст.")
         return df
-    
-    print(f"add_indicators: Исходный DataFrame содержит {len(df)} строк.")
-    print(f"add_indicators: Типы данных колонок до индикаторов: {df.dtypes.to_dict()}")
 
-    # Ручной расчет ATR
-    df = calculate_atr_manually(df.copy(), length=ATR_LENGTH) 
-    print(f"add_indicators: Ручной расчет ATR завершен.")
-    
+    df = calculate_atr_manually(df.copy(), length=ATR_LENGTH)
+
     if f'ATR_{ATR_LENGTH}' not in df.columns:
-        print(f"ВНИМАНИЕ: Колонка 'ATR_{ATR_LENGTH}' все еще не найдена после ручного расчета. Это очень странно.")
-        return pd.DataFrame() 
-    
-    # Добавление EMA и RSI через pandas_ta
+        logger.error(f"[{symbol}] ВНИМАНИЕ: Колонка 'ATR_{ATR_LENGTH}' все еще не найдена после ручного расчета. Это очень странно.")
+        return pd.DataFrame()
+
     df.ta.ema(length=50, append=True)
     df.ta.ema(length=200, append=True)
     df.ta.rsi(length=14, append=True)
 
-    # --- НОВЫЕ ИНДИКАТОРЫ ---
-    # MACD
     df.ta.macd(fast=MACD_FAST_LENGTH, slow=MACD_SLOW_LENGTH, signal=MACD_SIGNAL_LENGTH, append=True)
-    # Bollinger Bands
     df.ta.bbands(length=BB_LENGTH, std=BB_MULTIPLIER, append=True)
-    
+
     initial_rows = len(df)
-    df.dropna(inplace=True) 
+    df.dropna(inplace=True)
     rows_after_dropna = len(df)
 
     if rows_after_dropna == 0:
-        print(f"add_indicators: DataFrame стал пустым после dropna. Исходно: {initial_rows} строк.")
-    elif rows_after_dropna < max(200, ATR_LENGTH + 1, BB_LENGTH, MACD_SLOW_LENGTH + MACD_SIGNAL_LENGTH): # Увеличим минимальное количество строк
-        print(f"add_indicators: DataFrame имеет очень мало строк ({rows_after_dropna}) после dropna. Возможно, недостаточно для индикаторов.")
+        logger.warning(f"[{symbol}] add_indicators: DataFrame стал пустым после dropna. Исходно: {initial_rows} строк.")
+    elif rows_after_dropna < max(200, ATR_LENGTH + 1, BB_LENGTH, MACD_SLOW_LENGTH + MACD_SIGNAL_LENGTH):
+        logger.warning(f"[{symbol}] add_indicators: DataFrame имеет очень мало строк ({rows_after_dropna}) после dropna. Возможно, недостаточно для индикаторов.")
 
-    print(f"add_indicators: DataFrame после dropna содержит {len(df)} строк.")
     return df
 
-def analyze_data(df):
+def analyze_data(symbol, df):
     """
-    Анализирует последние данные и генерирует торговые сигналы,
-    включая расчет SL/TP на основе ATR.
+    Анализирует последние данные и генерирует торговые сигналы для конкретной пары.
     """
-    global bot_in_position, current_position_type, entry_price, \
-           stop_loss_price, take_profit_prices, tp_levels_hit, \
-           last_atr_for_sl_tp, original_stop_loss_price
-    
+    current_pair_state = bot_state[symbol]
+
     if df.empty:
-        print("analyze_data: DataFrame пуст после добавления индикаторов. Ожидание следующей итерации.")
+        logger.info(f"[{symbol}] analyze_data: DataFrame пуст после добавления индикаторов. Ожидание следующей итерации.")
         return "WAIT"
 
-    if len(df) < 1: 
-        print("analyze_data: DataFrame содержит менее одной свечи после обработки. Ожидание следующей итерации.")
+    if len(df) < 1:
+        logger.warning(f"[{symbol}] analyze_data: DataFrame содержит менее одной свечи после обработки. Ожидание следующей итерации.")
         return "WAIT"
 
-    # Обновленный список необходимых колонок
     required_columns = [
         f'EMA_50', f'EMA_200', f'RSI_14', f'ATR_{ATR_LENGTH}', 'close',
-        f'MACD_{MACD_FAST_LENGTH}_{MACD_SLOW_LENGTH}_{MACD_SIGNAL_LENGTH}', # MACD линия
-        f'MACDh_{MACD_FAST_LENGTH}_{MACD_SLOW_LENGTH}_{MACD_SIGNAL_LENGTH}', # MACD гистограмма
-        f'MACDs_{MACD_FAST_LENGTH}_{MACD_SLOW_LENGTH}_{MACD_SIGNAL_LENGTH}', # MACD сигнальная линия
-        f'BBL_{BB_LENGTH}_{BB_MULTIPLIER:.1f}', # Нижняя полоса Боллинджера
-        f'BBM_{BB_LENGTH}_{BB_MULTIPLIER:.1f}', # Средняя полоса Боллинджера
-        f'BBU_{BB_LENGTH}_{BB_MULTIPLIER:.1f}'  # Верхняя полоса Боллинджера
+        f'MACD_{MACD_FAST_LENGTH}_{MACD_SLOW_LENGTH}_{MACD_SIGNAL_LENGTH}',
+        f'MACDh_{MACD_FAST_LENGTH}_{MACD_SLOW_LENGTH}_{MACD_SIGNAL_LENGTH}',
+        f'MACDs_{MACD_FAST_LENGTH}_{MACD_SLOW_LENGTH}_{MACD_SIGNAL_LENGTH}',
+        f'BBL_{BB_LENGTH}_{BB_MULTIPLIER:.1f}',
+        f'BBM_{BB_LENGTH}_{BB_MULTIPLIER:.1f}',
+        f'BBU_{BB_LENGTH}_{BB_MULTIPLIER:.1f}'
     ]
     for col in required_columns:
         if col not in df.columns:
-            print(f"analyze_data: Ошибка: Не найдена необходимая колонка '{col}' в DataFrame. Проверьте расчет индикаторов.")
-            return "WAIT" 
+            logger.error(f"[{symbol}] analyze_data: Ошибка: Не найдена необходимая колонка '{col}' в DataFrame. Проверьте расчет индикаторов.")
+            return "WAIT"
 
     last_candle = df.iloc[-1]
-    
+
     current_ema_50 = last_candle[f'EMA_50']
     current_ema_200 = last_candle[f'EMA_200']
     current_rsi = last_candle[f'RSI_14']
     current_atr = last_candle[f'ATR_{ATR_LENGTH}']
     current_close_price = last_candle['close']
 
-    # --- Новые индикаторы ---
     current_macd = last_candle[f'MACD_{MACD_FAST_LENGTH}_{MACD_SLOW_LENGTH}_{MACD_SIGNAL_LENGTH}']
     current_macd_hist = last_candle[f'MACDh_{MACD_FAST_LENGTH}_{MACD_SLOW_LENGTH}_{MACD_SIGNAL_LENGTH}']
     current_macd_signal = last_candle[f'MACDs_{MACD_FAST_LENGTH}_{MACD_SLOW_LENGTH}_{MACD_SIGNAL_LENGTH}']
-    
+
     current_bb_lower = last_candle[f'BBL_{BB_LENGTH}_{BB_MULTIPLIER:.1f}']
     current_bb_middle = last_candle[f'BBM_{BB_LENGTH}_{BB_MULTIPLIER:.1f}']
     current_bb_upper = last_candle[f'BBU_{BB_LENGTH}_{BB_MULTIPLIER:.1f}']
 
-    # Проверка на NaN, inf (бесконечность) и очень маленькие значения для ключевых индикаторов
-    if (pd.isna(current_atr) or not np.isfinite(current_atr) or current_atr <= 0.00000001 or
+    if (pd.isna(current_atr) or not np.isfinite(current_atr) or current_atr <= 1e-10 or
         pd.isna(current_macd) or not np.isfinite(current_macd) or
         pd.isna(current_macd_signal) or not np.isfinite(current_macd_signal) or
         pd.isna(current_bb_lower) or not np.isfinite(current_bb_lower) or
         pd.isna(current_bb_upper) or not np.isfinite(current_bb_upper)):
-        print(f"analyze_data: Внимание: Один или несколько индикаторов содержат NaN, Inf или нулевое значение. Пропускаем анализ сигнала.")
-        print(f"  ATR: {current_atr:.4f}, MACD: {current_macd:.4f}, MACDs: {current_macd_signal:.4f}, BBL: {current_bb_lower:.2f}, BBU: {current_bb_upper:.2f}")
+        logger.warning(f"[{symbol}] analyze_data: Один или несколько индикаторов содержат NaN, Inf или нулевое/очень малое значение. Пропускаем анализ сигнала.")
+        logger.warning(f"[{symbol}]    ATR: {current_atr:.8f}, MACD: {current_macd:.8f}, MACDs: {current_macd_signal:.8f}, BBL: {current_bb_lower:.8f}, BBU: {current_bb_upper:.8f}")
+        logger.warning(f"[{symbol}]    Close: {current_close_price:.8f}")
         return "WAIT"
 
-    print(f"\n--- Анализ на {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (Таймфрейм: {TIMEFRAME}) ---")
-    print(f"Последняя свеча закрыта в: {last_candle['timestamp']}")
-    print(f"Цена закрытия: {current_close_price:.2f}")
-    print(f"EMA_50: {current_ema_50:.2f}")
-    print(f"EMA_200: {current_ema_200:.2f}")
-    print(f"RSI (14): {current_rsi:.2f}")
-    print(f"ATR ({ATR_LENGTH}): {current_atr:.2f}")
-    print(f"MACD ({MACD_FAST_LENGTH},{MACD_SLOW_LENGTH},{MACD_SIGNAL_LENGTH}): MACD={current_macd:.2f}, Signal={current_macd_signal:.2f}, Hist={current_macd_hist:.2f}")
-    print(f"Bollinger Bands ({BB_LENGTH},{BB_MULTIPLIER:.1f}): Lower={current_bb_lower:.2f}, Middle={current_bb_middle:.2f}, Upper={current_bb_upper:.2f}")
+    # --- Подробный вывод индикаторов только при наличии сигнала или уже открытой позиции ---
+    should_log_details = current_pair_state['bot_in_position']
+
+    # Условия для входа (для определения should_log_details, если нет позиции)
+    condition_long_ema_trend = current_ema_50 > current_ema_200
+    condition_long_rsi = current_rsi < 70
+    condition_long_macd = (current_macd > current_macd_signal) or (current_macd_hist > 0)
+    condition_long_bb = current_close_price > current_bb_middle
+
+    condition_short_ema_trend = current_ema_50 < current_ema_200
+    condition_short_rsi = current_rsi > 30
+    condition_short_macd = (current_macd < current_macd_signal) or (current_macd_hist < 0)
+    condition_short_bb = current_close_price < current_bb_middle
+
+    if not current_pair_state['bot_in_position']:
+        if (condition_long_ema_trend and condition_long_rsi and condition_long_macd and condition_long_bb) or \
+           (condition_short_ema_trend and condition_short_rsi and condition_short_macd and condition_short_bb):
+            should_log_details = True # Условия для входа выполнены, логируем подробно
+
+    if should_log_details:
+        logger.info(f"\n--- Анализ для {symbol} на {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (Таймфрейм: {TIMEFRAME}) ---")
+        logger.info(f"[{symbol}] Последняя свеча закрыта в: {last_candle['timestamp']}")
+        logger.info(f"[{symbol}] Цена закрытия: {current_close_price:.8f}")
+        logger.info(f"[{symbol}] EMA_50: {current_ema_50:.8f}")
+        logger.info(f"[{symbol}] EMA_200: {current_ema_200:.8f}")
+        logger.info(f"[{symbol}] RSI (14): {current_rsi:.8f}")
+        logger.info(f"[{symbol}] ATR ({ATR_LENGTH}): {current_atr:.8f}")
+        logger.info(f"[{symbol}] MACD ({MACD_FAST_LENGTH},{MACD_SLOW_LENGTH},{MACD_SIGNAL_LENGTH}): MACD={current_macd:.8f}, Signal={current_macd_signal:.8f}, Hist={current_macd_hist:.8f}")
+        logger.info(f"[{symbol}] Bollinger Bands ({BB_LENGTH},{BB_MULTIPLIER:.1f}): Lower={current_bb_lower:.8f}, Middle={current_bb_middle:.8f}, Upper={current_bb_upper:.8f}")
+        if current_pair_state['bot_in_position']:
+            logger.info(f"[{symbol}] Бот уже в позиции: {current_pair_state['current_position_type']} по цене {current_pair_state['entry_price']:.8f}")
+            logger.info(f"[{symbol}]    SL: {current_pair_state['stop_loss_price']:.8f}")
+            logger.info(f"[{symbol}]    TP1: {current_pair_state['take_profit_prices']['TP1']:.8f} ({"достигнут" if current_pair_state['tp_levels_hit']['TP1'] else "нет"})")
+            logger.info(f"[{symbol}]    TP2: {current_pair_state['take_profit_prices']['TP2']:.8f} ({"достигнут" if current_pair_state['tp_levels_hit']['TP2'] else "нет"})")
+            logger.info(f"[{symbol}]    TP3: {current_pair_state['take_profit_prices']['TP3']:.8f} ({"достигнут" if current_pair_state['tp_levels_hit']['TP3'] else "нет"})")
+            logger.info(f"[{symbol}]    Текущая цена: {current_close_price:.8f}")
+    else:
+        # Краткий вывод, если нет позиции и нет сигнала
+        logger.info(f"[{symbol}] Мониторинг. Цена: {current_close_price:.8f}. Без активной позиции и без сигнала.")
 
 
     signal = "WAIT"
-    
-    # --- Условия для входа (улучшенная стратегия) ---
-    
-    # Условия LONG
-    # Тренд: EMA_50 над EMA_200
-    condition_long_ema_trend = current_ema_50 > current_ema_200
-    # RSI: не перекуплен (или в зоне для входа)
-    condition_long_rsi = current_rsi < 50
-    # MACD: MACD линия пересекла сигнальную линию снизу вверх И MACD гистограмма положительная
-    condition_long_macd = (current_macd > current_macd_signal) and (current_macd_hist > 0)
-    # Bollinger Bands: Цена закрытия выше средней линии BB, или отскок от нижней полосы
-    # Для входа LONG, можно использовать, например, отскок от нижней полосы или пересечение средней
-    condition_long_bb = current_close_price > current_bb_middle # Простейшее условие: цена выше средней BB
 
-    # Условия SHORT
-    # Тренд: EMA_50 под EMA_200
-    condition_short_ema_trend = current_ema_50 < current_ema_200
-    # RSI: не перепродан (или в зоне для входа)
-    condition_short_rsi = current_rsi > 50
-    # MACD: MACD линия пересекла сигнальную линию сверху вниз И MACD гистограмма отрицательная
-    condition_short_macd = (current_macd < current_macd_signal) and (current_macd_hist < 0)
-    # Bollinger Bands: Цена закрытия ниже средней линии BB, или отскок от верхней полосы
-    condition_short_bb = current_close_price < current_bb_middle # Простейшее условие: цена ниже средней BB
+    if not current_pair_state['bot_in_position']:
+        if (condition_long_ema_trend and condition_long_rsi and
+                condition_long_macd and condition_long_bb):
 
-    if not bot_in_position: 
-        if (condition_long_ema_trend and condition_long_rsi and 
-            condition_long_macd and condition_long_bb):
-            
             signal = "BUY"
-            bot_in_position = True
-            current_position_type = "LONG"
-            entry_price = current_close_price
-            last_atr_for_sl_tp = current_atr # Сохраняем ATR на момент входа
-            
-            stop_loss_price = entry_price - (last_atr_for_sl_tp * SL_MULTIPLIER)
-            original_stop_loss_price = stop_loss_price # Сохраняем начальный SL для безубытка
-            take_profit_prices['TP1'] = entry_price + (last_atr_for_sl_tp * TP1_MULTIPLIER)
-            take_profit_prices['TP2'] = entry_price + (last_atr_for_sl_tp * TP2_MULTIPLIER)
-            take_profit_prices['TP3'] = entry_price + (last_atr_for_sl_tp * TP3_MULTIPLIER)
-            tp_levels_hit = {'TP1': False, 'TP2': False, 'TP3': False} 
-            
+            current_pair_state['bot_in_position'] = True
+            current_pair_state['current_position_type'] = "LONG"
+            current_pair_state['entry_price'] = current_close_price
+            current_pair_state['last_atr_for_sl_tp'] = current_atr
+
+            current_pair_state['stop_loss_price'] = current_pair_state['entry_price'] - (current_pair_state['last_atr_for_sl_tp'] * SL_MULTIPLIER)
+            current_pair_state['original_stop_loss_price'] = current_pair_state['stop_loss_price'] # Сохраняем первоначальный SL
+            current_pair_state['take_profit_prices']['TP1'] = current_pair_state['entry_price'] + (current_pair_state['last_atr_for_sl_tp'] * TP1_MULTIPLIER)
+            current_pair_state['take_profit_prices']['TP2'] = current_pair_state['entry_price'] + (current_pair_state['last_atr_for_sl_tp'] * TP2_MULTIPLIER)
+            current_pair_state['take_profit_prices']['TP3'] = current_pair_state['entry_price'] + (current_pair_state['last_atr_for_sl_tp'] * TP3_MULTIPLIER)
+            current_pair_state['tp_levels_hit'] = {'TP1': False, 'TP2': False, 'TP3': False}
+
+            save_bot_state()
+
             expected_duration_min = EXPECTED_MOVE_CANDLES_MIN * int(TIMEFRAME[:-1])
             expected_duration_max = EXPECTED_MOVE_CANDLES_MAX * int(TIMEFRAME[:-1])
-            
-            print(f"Сигнал: **ПОКУПКА (LONG)** - Ожидается повышение.")
-            print(f"  Вход: {entry_price:.2f}")
-            print(f"  **Стоп-Лосс (SL):** ~{stop_loss_price:.2f} ({SL_MULTIPLIER} * ATR_входа)")
-            print(f"  **Тейк-Профит 1 (TP1):** ~{take_profit_prices['TP1']:.2f} ({TP1_MULTIPLIER} * ATR_входа)")
-            print(f"  **Тейк-Профит 2 (TP2):** ~{take_profit_prices['TP2']:.2f} ({TP2_MULTIPLIER} * ATR_входа)")
-            print(f"  **Тейк-Профит 3 (TP3):** ~{take_profit_prices['TP3']:.2f} ({TP3_MULTIPLIER} * ATR_входа)")
-            print(f"  **Ожидаемая длительность движения:** От {expected_duration_min:.0f} до {expected_duration_max:.0f} минут (на основе {TIMEFRAME} свечей).")
-            
-        elif (condition_short_ema_trend and condition_short_rsi and 
+
+            logger.info(f"[{symbol}] Сигнал: **ПОКУПКА (LONG)** - Открываем позицию.")
+            logger.info(f"[{symbol}]    Вход: {current_pair_state['entry_price']:.8f}")
+            logger.info(f"[{symbol}]    **Стоп-Лосс (SL):** ~{current_pair_state['stop_loss_price']:.8f} ({SL_MULTIPLIER} * ATR_входа)")
+            logger.info(f"[{symbol}]    **Тейк-Профит 1 (TP1):** ~{current_pair_state['take_profit_prices']['TP1']:.8f} ({TP1_MULTIPLIER} * ATR_входа)")
+            logger.info(f"[{symbol}]    **Тейк-Профит 2 (TP2):** ~{current_pair_state['take_profit_prices']['TP2']:.8f} ({TP2_MULTIPLIER} * ATR_входа)")
+            logger.info(f"[{symbol}]    **Тейк-Профит 3 (TP3):** ~{current_pair_state['take_profit_prices']['TP3']:.8f} ({TP3_MULTIPLIER} * ATR_входа)")
+            logger.info(f"[{symbol}]    **Ожидаемая длительность движения:** От {expected_duration_min:.0f} до {expected_duration_max:.0f} минут.")
+
+        elif (condition_short_ema_trend and condition_short_rsi and
               condition_short_macd and condition_short_bb):
-            
-            signal = "SELL" 
-            bot_in_position = True
-            current_position_type = "SHORT"
-            entry_price = current_close_price
-            last_atr_for_sl_tp = current_atr # Сохраняем ATR на момент входа
-            
-            stop_loss_price = entry_price + (last_atr_for_sl_tp * SL_MULTIPLIER)
-            original_stop_loss_price = stop_loss_price # Сохраняем начальный SL для безубытка
-            take_profit_prices['TP1'] = entry_price - (last_atr_for_sl_tp * TP1_MULTIPLIER)
-            take_profit_prices['TP2'] = entry_price - (last_atr_for_sl_tp * TP2_MULTIPLIER)
-            take_profit_prices['TP3'] = entry_price - (last_atr_for_sl_tp * TP3_MULTIPLIER)
-            tp_levels_hit = {'TP1': False, 'TP2': False, 'TP3': False} 
-            
+
+            signal = "SELL"
+            current_pair_state['bot_in_position'] = True
+            current_pair_state['current_position_type'] = "SHORT"
+            current_pair_state['entry_price'] = current_close_price
+            current_pair_state['last_atr_for_sl_tp'] = current_atr
+
+            current_pair_state['stop_loss_price'] = current_pair_state['entry_price'] + (current_pair_state['last_atr_for_sl_tp'] * SL_MULTIPLIER)
+            current_pair_state['original_stop_loss_price'] = current_pair_state['stop_loss_price'] # Сохраняем первоначальный SL
+            current_pair_state['take_profit_prices']['TP1'] = current_pair_state['entry_price'] - (current_pair_state['last_atr_for_sl_tp'] * TP1_MULTIPLIER)
+            current_pair_state['take_profit_prices']['TP2'] = current_pair_state['entry_price'] - (current_pair_state['last_atr_for_sl_tp'] * TP2_MULTIPLIER)
+            current_pair_state['take_profit_prices']['TP3'] = current_pair_state['entry_price'] - (current_pair_state['last_atr_for_sl_tp'] * TP3_MULTIPLIER)
+            current_pair_state['tp_levels_hit'] = {'TP1': False, 'TP2': False, 'TP3': False}
+
+            save_bot_state()
+
             expected_duration_min = EXPECTED_MOVE_CANDLES_MIN * int(TIMEFRAME[:-1])
             expected_duration_max = EXPECTED_MOVE_CANDLES_MAX * int(TIMEFRAME[:-1])
-            
-            print(f"Сигнал: **ПРОДАЖА (SHORT)** - Ожидается понижение.")
-            print(f"  Вход: {entry_price:.2f}")
-            print(f"  **Стоп-Лосс (SL):** ~{stop_loss_price:.2f} ({SL_MULTIPLIER} * ATR_входа)")
-            print(f"  **Тейк-Профит 1 (TP1):** ~{take_profit_prices['TP1']:.2f} ({TP1_MULTIPLIER} * ATR_входа)")
-            print(f"  **Тейк-Профит 2 (TP2):** ~{take_profit_prices['TP2']:.2f} ({TP2_MULTIPLIER} * ATR_входа)")
-            print(f"  **Тейк-Профит 3 (TP3):** ~{take_profit_prices['TP3']:.2f} ({TP3_MULTIPLIER} * ATR_входа)")
-            print(f"  **Ожидаемая длительность движения:** От {expected_duration_min:.0f} до {expected_duration_max:.0f} минут (на основе {TIMEFRAME} свечей).")
+
+            logger.info(f"[{symbol}] Сигнал: **ПРОДАЖА (SHORT)** - Открываем позицию.")
+            logger.info(f"[{symbol}]    Вход: {current_pair_state['entry_price']:.8f}")
+            logger.info(f"[{symbol}]    **Стоп-Лосс (SL):** ~{current_pair_state['stop_loss_price']:.8f} ({SL_MULTIPLIER} * ATR_входа)")
+            logger.info(f"[{symbol}]    **Тейк-Профит 1 (TP1):** ~{current_pair_state['take_profit_prices']['TP1']:.8f} ({TP1_MULTIPLIER} * ATR_входа)")
+            logger.info(f"[{symbol}]    **Тейк-Профит 2 (TP2):** ~{current_pair_state['take_profit_prices']['TP2']:.8f} ({TP2_MULTIPLIER} * ATR_входа)")
+            logger.info(f"[{symbol}]    **Тейк-Профит 3 (TP3):** ~{current_pair_state['take_profit_prices']['TP3']:.8f} ({TP3_MULTIPLIER} * ATR_входа)")
+            logger.info(f"[{symbol}]    **Ожидаемая длительность движения:** От {expected_duration_min:.0f} до {expected_duration_max:.0f} минут.")
         else:
-            print("Сигнал: ОЖИДАНИЕ - Условия для входа не выполнены.")
-            # Добавим причины, почему не было входа
-            reasons = []
-            if not (condition_long_ema_trend or condition_short_ema_trend):
-                reasons.append("Тренд по EMA_50/EMA_200 не определен.")
-            if not (condition_long_rsi or condition_short_rsi):
-                reasons.append("RSI в неопределенной зоне.")
-            if not (condition_long_macd or condition_short_macd):
-                reasons.append("MACD не дал сигнала.")
-            if not (condition_long_bb or condition_short_bb):
-                reasons.append("Цена не соответствует условиям Bollinger Bands.")
-            print("  Причины: " + ", ".join(reasons) if reasons else "Нет явных причин (просто условия не совпали).")
+            if should_log_details:
+                long_reasons = []
+                short_reasons = []
+
+                if not condition_long_ema_trend: long_reasons.append("EMA тренд не восходящий.")
+                if not condition_long_rsi: long_reasons.append(f"RSI >= {70}.")
+                if not condition_long_macd: long_reasons.append("MACD не бычий.")
+                if not condition_long_bb: long_reasons.append("Цена не выше средней BB.")
+                if long_reasons:
+                    logger.info(f"[{symbol}]    Не выполнены условия для LONG: {'; '.join(long_reasons)}")
+
+                if not condition_short_ema_trend: short_reasons.append("EMA тренд не нисходящий.")
+                if not condition_short_rsi: short_reasons.append(f"RSI <= {30}.")
+                if not condition_short_macd: short_reasons.append("MACD не медвежий.")
+                if not condition_short_bb: short_reasons.append("Цена не ниже средней BB.")
+                if short_reasons:
+                    logger.info(f"[{symbol}]    Не выполнены условия для SHORT: {'; '.join(short_reasons)}")
+
+                if not long_reasons and not short_reasons:
+                    logger.info(f"[{symbol}]    Нет явных причин (просто условия не совпали для текущих настроек).")
 
 
     else: # Если бот уже в позиции, отслеживаем её и проверяем SL/TP
-        print(f"Бот уже в позиции: {current_position_type} по цене {entry_price:.2f}")
-        print(f"  SL: {stop_loss_price:.2f}")
-        print(f"  TP1: {take_profit_prices['TP1']:.2f} ({"достигнут" if tp_levels_hit['TP1'] else "нет"})")
-        print(f"  TP2: {take_profit_prices['TP2']:.2f} ({"достигнут" if tp_levels_hit['TP2'] else "нет"})")
-        print(f"  TP3: {take_profit_prices['TP3']:.2f} ({"достигнут" if tp_levels_hit['TP3'] else "нет"})")
-        print(f"  Текущая цена: {current_close_price:.2f}")
+        
+        # --- Логика Break-Even Stop ---
+        position_closed = False
 
-        # --- Логика Trailing Stop и Break-Even Stop ---
-        if current_position_type == "LONG":
-            # Break-Even Stop: Если TP1 достигнут, переводим SL в безубыток (цена входа)
-            if ENABLE_BREAK_EVEN_STOP and tp_levels_hit['TP1'] and stop_loss_price < entry_price:
-                print(f"  TP1 достигнут, перевод SL в безубыток: {entry_price:.2f}")
-                stop_loss_price = entry_price # Или entry_price + небольшая комиссия
-            
-            # Trailing Stop: SL подтягивается, если цена идет выше
-            # Только если текущая цена уже значительно выше предыдущего SL
-            # ATR_входа используется для определения шага Trailing Stop
-            new_trailing_sl = current_close_price - (last_atr_for_sl_tp * TRAILING_STOP_PERCENTAGE)
-            if new_trailing_sl > stop_loss_price:
-                print(f"  **Trailing SL LONG:** SL повышен с {stop_loss_price:.2f} до {new_trailing_sl:.2f}")
-                stop_loss_price = new_trailing_sl
-
-            if current_close_price <= stop_loss_price:
-                print(f"**ЗАКРЫТИЕ LONG по СТОП-ЛОССУ:** Цена {current_close_price:.2f} <= SL {stop_loss_price:.2f}.")
+        if current_pair_state['current_position_type'] == "LONG":
+            if current_close_price <= current_pair_state['stop_loss_price']:
+                logger.info(f"[{symbol}] **ЗАКРЫТИЕ LONG по СТОП-ЛОССУ:** Цена {current_close_price:.8f} <= SL {current_pair_state['stop_loss_price']:.8f}.")
                 signal = "CLOSE_LONG_SL"
-                # Сброс состояния бота
-                bot_in_position = False
-                current_position_type = None
-                entry_price = None
-                stop_loss_price = None
-                take_profit_prices = {}
-                tp_levels_hit = {'TP1': False, 'TP2': False, 'TP3': False}
-                last_atr_for_sl_tp = None
-                original_stop_loss_price = None
-            else: 
-                # Проверяем TP3, потом TP2, потом TP1
-                # Важно: TP уровни проверяются от самого дальнего к ближнему
-                if not tp_levels_hit['TP3'] and current_close_price >= take_profit_prices['TP3']:
-                    print(f"**ЗАКРЫТИЕ ЧАСТИ LONG по TP3:** Цена {current_close_price:.2f} >= TP3 {take_profit_prices['TP3']:.2f}.")
-                    tp_levels_hit['TP3'] = True
-                    signal = "PARTIAL_CLOSE_LONG_TP3" 
-                elif not tp_levels_hit['TP2'] and current_close_price >= take_profit_prices['TP2']:
-                    print(f"**ЗАКРЫТИЕ ЧАСТИ LONG по TP2:** Цена {current_close_price:.2f} >= TP2 {take_profit_prices['TP2']:.2f}.")
-                    tp_levels_hit['TP2'] = True
+                position_closed = True
+            else:
+                if not current_pair_state['tp_levels_hit']['TP3'] and current_close_price >= current_pair_state['take_profit_prices']['TP3']:
+                    logger.info(f"[{symbol}] **ЗАКРЫТИЕ ЧАСТИ LONG по TP3:** Цена {current_close_price:.8f} >= TP3 {current_pair_state['take_profit_prices']['TP3']:.8f}.")
+                    current_pair_state['tp_levels_hit']['TP3'] = True
+                    signal = "PARTIAL_CLOSE_LONG_TP3"
+                elif not current_pair_state['tp_levels_hit']['TP2'] and current_close_price >= current_pair_state['take_profit_prices']['TP2']:
+                    logger.info(f"[{symbol}] **ЗАКРЫТИЕ ЧАСТИ LONG по TP2:** Цена {current_close_price:.8f} >= TP2 {current_pair_state['take_profit_prices']['TP2']:.8f}.")
+                    current_pair_state['tp_levels_hit']['TP2'] = True
                     signal = "PARTIAL_CLOSE_LONG_TP2"
-                elif not tp_levels_hit['TP1'] and current_close_price >= take_profit_prices['TP1']:
-                    print(f"**ЗАКРЫТИЕ ЧАСТИ LONG по TP1:** Цена {current_close_price:.2f} >= TP1 {take_profit_prices['TP1']:.2f}.")
-                    tp_levels_hit['TP1'] = True
+                elif not current_pair_state['tp_levels_hit']['TP1'] and current_close_price >= current_pair_state['take_profit_prices']['TP1']:
+                    logger.info(f"[{symbol}] **ЗАКРЫТИЕ ЧАСТИ LONG по TP1:** Цена {current_close_price:.8f} >= TP1 {current_pair_state['take_profit_prices']['TP1']:.8f}.")
+                    current_pair_state['tp_levels_hit']['TP1'] = True
                     signal = "PARTIAL_CLOSE_LONG_TP1"
                 else:
-                    print("  Позиция LONG удерживается.")
+                    logger.info(f"[{symbol}]    Позиция LONG удерживается.")
 
-        elif current_position_type == "SHORT":
-            # Break-Even Stop: Если TP1 достигнут, переводим SL в безубыток (цена входа)
-            if ENABLE_BREAK_EVEN_STOP and tp_levels_hit['TP1'] and stop_loss_price > entry_price:
-                print(f"  TP1 достигнут, перевод SL в безубыток: {entry_price:.2f}")
-                stop_loss_price = entry_price # Или entry_price - небольшая комиссия
-            
-            # Trailing Stop: SL подтягивается, если цена идет ниже
-            new_trailing_sl = current_close_price + (last_atr_for_sl_tp * TRAILING_STOP_PERCENTAGE)
-            if new_trailing_sl < stop_loss_price:
-                print(f"  **Trailing SL SHORT:** SL понижен с {stop_loss_price:.2f} до {new_trailing_sl:.2f}")
-                stop_loss_price = new_trailing_sl
-
-
-            if current_close_price >= stop_loss_price:
-                print(f"**ЗАКРЫТИЕ SHORT по СТОП-ЛОССУ:** Цена {current_close_price:.2f} >= SL {stop_loss_price:.2f}.")
+        elif current_pair_state['current_position_type'] == "SHORT":
+            if current_close_price >= current_pair_state['stop_loss_price']:
+                logger.info(f"[{symbol}] **ЗАКРЫТИЕ SHORT по СТОП-ЛОССУ:** Цена {current_close_price:.8f} >= SL {current_pair_state['stop_loss_price']:.8f}.")
                 signal = "CLOSE_SHORT_SL"
-                # Сброс состояния бота
-                bot_in_position = False
-                current_position_type = None
-                entry_price = None
-                stop_loss_price = None
-                take_profit_prices = {}
-                tp_levels_hit = {'TP1': False, 'TP2': False, 'TP3': False}
-                last_atr_for_sl_tp = None
-                original_stop_loss_price = None
-            else: 
-                # Проверяем TP3, потом TP2, потом TP1
-                if not tp_levels_hit['TP3'] and current_close_price <= take_profit_prices['TP3']:
-                    print(f"**ЗАКРЫТИЕ ЧАСТИ SHORT по TP3:** Цена {current_close_price:.2f} <= TP3 {take_profit_prices['TP3']:.2f}.")
-                    tp_levels_hit['TP3'] = True
+                position_closed = True
+            else:
+                if not current_pair_state['tp_levels_hit']['TP3'] and current_close_price <= current_pair_state['take_profit_prices']['TP3']:
+                    logger.info(f"[{symbol}] **ЗАКРЫТИЕ ЧАСТИ SHORT по TP3:** Цена {current_close_price:.8f} <= TP3 {current_pair_state['take_profit_prices']['TP3']:.8f}.")
+                    current_pair_state['tp_levels_hit']['TP3'] = True
                     signal = "PARTIAL_CLOSE_SHORT_TP3"
-                elif not tp_levels_hit['TP2'] and current_close_price <= take_profit_prices['TP2']:
-                    print(f"**ЗАКРЫТИЕ ЧАСТИ SHORT по TP2:** Цена {current_close_price:.2f} <= TP2 {take_profit_prices['TP2']:.2f}.")
-                    tp_levels_hit['TP2'] = True
+                elif not current_pair_state['tp_levels_hit']['TP2'] and current_close_price <= current_pair_state['take_profit_prices']['TP2']:
+                    logger.info(f"[{symbol}] **ЗАКРЫТИЕ ЧАСТИ SHORT по TP2:** Цена {current_close_price:.8f} <= TP2 {current_pair_state['take_profit_prices']['TP2']:.8f}.")
+                    current_pair_state['tp_levels_hit']['TP2'] = True
                     signal = "PARTIAL_CLOSE_SHORT_TP2"
-                elif not tp_levels_hit['TP1'] and current_close_price <= take_profit_prices['TP1']:
-                    print(f"**ЗАКРЫТИЕ ЧАСТИ SHORT по TP1:** Цена {current_close_price:.2f} <= TP1 {take_profit_prices['TP1']:.2f}.")
-                    tp_levels_hit['TP1'] = True
+                elif not current_pair_state['tp_levels_hit']['TP1'] and current_close_price <= current_pair_state['take_profit_prices']['TP1']:
+                    logger.info(f"[{symbol}] **ЗАКРЫТИЕ ЧАСТИ SHORT по TP1:** Цена {current_close_price:.8f} <= TP1 {current_pair_state['take_profit_prices']['TP1']:.8f}.")
+                    current_pair_state['tp_levels_hit']['TP1'] = True
                     signal = "PARTIAL_CLOSE_SHORT_TP1"
                 else:
-                    print("  Позиция SHORT удерживается.")
+                    logger.info(f"[{symbol}]    Позиция SHORT удерживается.")
+
+        if position_closed:
+            bot_state[symbol] = initialize_pair_state(symbol)
+            save_bot_state()
 
     return signal
 
 # --- ОСНОВНАЯ ЛОГИКА БОТА ---
 if __name__ == "__main__":
-    print("Бот для мониторинга рынка запущен. Нажмите Ctrl+C для остановки.")
-    print("Внимание: это демонстрационный режим, реальные ордера не исполняются.")
+    logger.info("Бот для мониторинга рынка запущен. Нажмите Ctrl+C для остановки.")
+    logger.info("Внимание: это демонстрационный режим, реальные ордера не исполняются.")
+
+    logger.setLevel(logging.INFO)
+
+    # 1. Сначала загружаем конфигурацию
+    load_config()
+    # 2. Затем загружаем состояние бота, используя символы из загруженной конфигурации
+    load_bot_state()
+
     try:
         while True:
-            data = fetch_data()
-            
-            if data is not None and not data.empty:
-                data_with_indicators = add_indicators(data)
-                
-                if not data_with_indicators.empty:
-                    signal = analyze_data(data_with_indicators)
-                    
-                    if signal == "BUY":
-                        print("!!! СИГНАЛ: ОТКРЫТЬ LONG ПОЗИЦИЮ !!!")
-                    elif signal == "SELL":
-                        print("!!! СИГНАЛ: ОТКРЫТЬ SHORT ПОЗИЦИЮ !!!")
-                    elif signal == "CLOSE_LONG_SL":
-                        print("!!! СИГНАЛ: ЗАКРЫТЬ LONG ПО СТОП-ЛОССУ !!!")
-                    elif signal == "CLOSE_SHORT_SL":
-                        print("!!! СИГНАЛ: ЗАКРЫТЬ SHORT ПО СТОП-ЛОССУ !!!")
-                    elif "PARTIAL_CLOSE_LONG_TP" in signal:
-                        print(f"!!! СИГНАЛ: ЧАСТИЧНО ЗАКРЫТЬ LONG ПО {signal.split('_')[-1]} !!!")
-                    elif "PARTIAL_CLOSE_SHORT_TP" in signal:
-                        print(f"!!! СИГНАЛ: ЧАСТИЧНО ЗАКРЫТЬ SHORT ПО {signal.split('_')[-1]} !!!")
-                else:
-                    print("DataFrame стал пустым после добавления индикаторов. Пропускаем анализ этой итерации.")
-            else:
-                print("Не удалось получить данные или DataFrame пуст. Повторная попытка через заданный интервал.")
+            for symbol in SYMBOLS:
+                data = fetch_data(symbol)
 
-            print(f"\nОжидание {MONITORING_INTERVAL_SECONDS} секунд до следующей проверки...")
+                if data is not None and not data.empty:
+                    data_with_indicators = add_indicators(data, symbol)
+
+                    if not data_with_indicators.empty:
+                        signal = analyze_data(symbol, data_with_indicators)
+
+                    else:
+                        logger.warning(f"[{symbol}] DataFrame стал пустым после добавления индикаторов. Пропускаем анализ этой итерации.")
+                else:
+                    logger.warning(f"[{symbol}] Не удалось получить данные или DataFrame пуст после fetch_data (возможно, критическая ошибка или повторные попытки не увенчались успехом).")
+
+            logger.info(f"\nОжидание {MONITORING_INTERVAL_SECONDS} секунд до следующей проверки всех пар...")
             time.sleep(MONITORING_INTERVAL_SECONDS)
 
     except KeyboardInterrupt:
-        print("\nБот остановлен пользователем.")
+        logger.info("\nБот остановлен пользователем.")
+        save_bot_state()
     except Exception as e:
-        print(f"Произошла непредвиденная ошибка в основном цикле: {e}")
+        logger.critical(f"Произошла непредвиденная ошибка в основном цикле: {e}", exc_info=True)
+        save_bot_state()
