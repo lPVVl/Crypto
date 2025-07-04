@@ -11,7 +11,12 @@
             "TP3": false
         },
         "last_atr_for_sl_tp": null,
-        "original_stop_loss_price": null
+        "original_stop_loss_price": null,
+        "last_reversal_check_time": 0,
+        "fib_swing_points": {
+            "low": null,
+            "high": null
+        }
     },
     "ETH/USDT": {
         "bot_in_position": false,
@@ -25,9 +30,60 @@
             "TP3": false
         },
         "last_atr_for_sl_tp": null,
-        "original_stop_loss_price": null
+        "original_stop_loss_price": null,
+        "last_reversal_check_time": 0,
+        "fib_swing_points": {
+            "low": null,
+            "high": null
+        }
     },
     "BNB/USDT": {
+        "bot_in_position": true,
+        "current_position_type": "SHORT",
+        "entry_price": 658.35,
+        "stop_loss_price": 658.35,
+        "take_profit_prices": {
+            "TP1": 657.4409538607359,
+            "TP2": 656.5319077214718,
+            "TP3": 655.6228615822077
+        },
+        "tp_levels_hit": {
+            "TP1": true,
+            "TP2": false,
+            "TP3": false
+        },
+        "last_atr_for_sl_tp": 0.9090461392640865,
+        "original_stop_loss_price": 659.7135692088962,
+        "last_reversal_check_time": 0,
+        "fib_swing_points": {
+            "low": null,
+            "high": null
+        }
+    },
+    "SOL/USDT": {
+        "bot_in_position": true,
+        "current_position_type": "SHORT",
+        "entry_price": 150.88,
+        "stop_loss_price": 151.78948721524984,
+        "take_profit_prices": {
+            "TP1": 150.27367518983343,
+            "TP2": 149.66735037966686,
+            "TP3": 149.06102556950032
+        },
+        "tp_levels_hit": {
+            "TP1": true,
+            "TP2": false,
+            "TP3": false
+        },
+        "last_atr_for_sl_tp": 0.606324810166563,
+        "original_stop_loss_price": 151.78948721524984,
+        "last_reversal_check_time": 0,
+        "fib_swing_points": {
+            "low": null,
+            "high": null
+        }
+    },
+    "XRP/USDT": {
         "bot_in_position": false,
         "current_position_type": null,
         "entry_price": null,
@@ -39,6 +95,26 @@
             "TP3": false
         },
         "last_atr_for_sl_tp": null,
-        "original_stop_loss_price": null
+        "original_stop_loss_price": null,
+        "last_reversal_check_time": 0,
+        "fib_swing_points": {
+            "low": null,
+            "high": null
+        }
+    },
+    "CAKE/USDT": {
+        "bot_in_position": false,
+        "current_position_type": null,
+        "entry_price": null,
+        "stop_loss_price": null,
+        "take_profit_prices": {},
+        "tp_levels_hit": {
+            "TP1": false,
+            "TP2": false,
+            "TP3": false
+        },
+        "last_atr_for_sl_tp": null,
+        "original_stop_loss_price": null,
+        "last_reversal_check_time": 0
     }
 }

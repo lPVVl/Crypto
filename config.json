@@ -2,7 +2,10 @@
     "symbols": [
         "BTC/USDT",
         "ETH/USDT",
-        "BNB/USDT"
+        "BNB/USDT",
+        "SOL/USDT",
+        "XRP/USDT",
+        "CAKE/USDT"
     ],
     "timeframe": "5m",
     "monitoring_interval_seconds": 60

@@ -33,7 +33,15 @@ STATE_FILE = 'bot_state.json'
 SYMBOLS = []
 TIMEFRAME = '5m'
 MONITORING_INTERVAL_SECONDS = 60
-EXCHANGE = ccxt.binance() # Выбираем биржу Binance
+
+# --- ИЗМЕНЕНИЕ ЗДЕСЬ: Инициализация биржи для ФЬЮЧЕРСОВ (USDT-M) ---
+try:
+    EXCHANGE = ccxt.binanceusdm() # Используем binanceusdm для USDT-M фьючерсов
+    EXCHANGE.load_markets() # Загружаем рынки, чтобы убедиться в подключении
+    logger.info("Биржа Binance USDT-M Futures успешно инициализирована.")
+except Exception as e:
+    logger.critical(f"Ошибка при инициализации биржи Binance USDT-M Futures: {e}", exc_info=True)
+    exit()
 
 # --- НАСТРОЙКИ СТРАТЕГИИ: SL, TP, ATR ---
 ATR_LENGTH = 14
@@ -52,16 +60,10 @@ BB_LENGTH = 20
 BB_MULTIPLIER = 2.0
 
 # --- НАСТРОЙКИ УПРАВЛЕНИЯ ПОЗИЦИЕЙ ---
-# ENABLE_BREAK_EVEN_STOP = True  # Это больше не используется для логики безубытка
-                               # но может быть полезно для других модификаций в будущем
-
-# Примерная ожидаемая длительность движения в свечах (на основе таймфрейма)
 EXPECTED_MOVE_CANDLES_MIN = 3
 EXPECTED_MOVE_CANDLES_MAX = 6
 
 # --- НАСТРОЙКИ АНАЛИЗА РАЗВОРОТА ---
-# Минимальное время между проверками разворота для конкретной пары (в секундах)
-# Это нужно, чтобы не заваливать логи сообщениями о развороте и не реагировать слишком быстро
 REVERSAL_CHECK_INTERVAL_SECONDS = 300 # 5 минут
 
 # --- ГЛОБАЛЬНАЯ ПЕРЕМЕННАЯ СОСТОЯНИЯ БОТА ---
@@ -74,7 +76,6 @@ def load_config():
 
     if not os.path.exists(CONFIG_FILE):
         logger.error(f"Файл конфигурации '{CONFIG_FILE}' не найден. Создайте его с необходимыми настройками.")
-        # Создаем дефолтный конфиг, если его нет
         default_config = {
             "symbols": [
                 'BTC/USDT',
@@ -87,7 +88,6 @@ def load_config():
         with open(CONFIG_FILE, 'w') as f:
             json.dump(default_config, f, indent=4)
         logger.info(f"Создан дефолтный файл конфигурации '{CONFIG_FILE}'. Пожалуйста, отредактируйте его.")
-        # Выходим, так как без настроек бот не может работать
         exit()
 
     try:
@@ -125,14 +125,13 @@ def initialize_pair_state(symbol):
         'take_profit_prices': {},
         'tp_levels_hit': {'TP1': False, 'TP2': False, 'TP3': False},
         'last_atr_for_sl_tp': None,
-        'original_stop_loss_price': None, # Сохраняем первоначальный SL
-        'last_reversal_check_time': 0 # Время последней проверки на разворот (timestamp)
+        'original_stop_loss_price': None,
+        'last_reversal_check_time': 0
     }
 
 def save_bot_state():
     """Сохраняет текущее состояние бота (для всех пар) в JSON файл."""
     try:
-        # Сохраняем только те символы, которые есть в текущем списке SYMBOLS
         state_to_save = {s: bot_state[s] for s in SYMBOLS if s in bot_state}
         with open(STATE_FILE, 'w') as f:
             json.dump(state_to_save, f, indent=4)
@@ -146,7 +145,6 @@ def load_bot_state():
 
     if not os.path.exists(STATE_FILE):
         logger.info(f"Файл состояния {STATE_FILE} не найден. Запуск с начальным состоянием для каждой пары.")
-        # Инициализируем состояние только для символов из текущего конфига
         for symbol in SYMBOLS:
             bot_state[symbol] = initialize_pair_state(symbol)
         return
@@ -156,17 +154,26 @@ def load_bot_state():
             loaded_state = json.load(f)
 
         new_bot_state = {}
-        # Проходим по символам из текущего конфига
         for symbol in SYMBOLS:
             if symbol in loaded_state:
-                new_bot_state[symbol] = loaded_state[symbol]
-                # Добавляем новые поля, если они появились в initialize_pair_state
+                pair_state = loaded_state[symbol]
                 default_state = initialize_pair_state(symbol)
                 for key, value in default_state.items():
-                    if key not in new_bot_state[symbol]:
-                        new_bot_state[symbol][key] = value
+                    if key not in pair_state:
+                        pair_state[key] = value
+                
+                # --- ЛОГИКА МИГРАЦИИ/ПРОВЕРКИ СОСТОЯНИЯ ---
+                if pair_state.get('bot_in_position') and \
+                   pair_state.get('tp_levels_hit', {}).get('TP1') and \
+                   pair_state.get('tp_levels_hit', {}).get('TP2') and \
+                   pair_state.get('tp_levels_hit', {}).get('TP3'):
+                    logger.warning(f"[{symbol}] Обнаружена 'зависшая' позиция (все TP достигнуты, но позиция активна) при загрузке состояния. Сброс состояния для {symbol}.")
+                    new_bot_state[symbol] = initialize_pair_state(symbol)
+                else:
+                    new_bot_state[symbol] = pair_state
+                # --- КОНЕЦ ЛОГИКИ МИГРАЦИИ ---
+
             else:
-                # Если символ новый, инициализируем его состояние
                 new_bot_state[symbol] = initialize_pair_state(symbol)
 
         bot_state = new_bot_state
@@ -178,13 +185,13 @@ def load_bot_state():
 
     except json.JSONDecodeError as e:
         logger.error(f"Ошибка декодирования JSON из файла состояния {STATE_FILE}: {e}. Файл может быть поврежден. Запуск с начальным состоянием для каждой пары.", exc_info=True)
-        bot_state = {} # Сбрасываем все
-        for symbol in SYMBOLS: # Инициализируем только для текущих символов
+        bot_state = {}
+        for symbol in SYMBOLS:
             bot_state[symbol] = initialize_pair_state(symbol)
     except Exception as e:
         logger.error(f"Неизвестная ошибка при загрузке состояния бота из {STATE_FILE}: {e}. Запуск с начальным состоянием для каждой пары.", exc_info=True)
-        bot_state = {} # Сбрасываем все
-        for symbol in SYMBOLS: # Инициализируем только для текущих символов
+        bot_state = {}
+        for symbol in SYMBOLS:
             bot_state[symbol] = initialize_pair_state(symbol)
 
 # --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ПОВТОРНЫХ ПОПЫТОК ---
@@ -278,7 +285,6 @@ def analyze_reversal_opportunity(symbol, df, current_position_type, current_clos
     Анализирует возможность разворота тренда после достижения TP.
     Это демонстрационная функция, требующая доработки для реальной стратегии разворота.
     """
-    # Проверяем, не слишком ли часто мы проверяем разворот
     current_time = time.time()
     if (current_time - bot_state[symbol]['last_reversal_check_time']) < REVERSAL_CHECK_INTERVAL_SECONDS:
         logger.debug(f"[{symbol}] Пропуск проверки разворота: слишком короткий интервал с последней проверки.")
@@ -286,15 +292,10 @@ def analyze_reversal_opportunity(symbol, df, current_position_type, current_clos
 
     logger.info(f"\n--- Проверка возможного разворота для {symbol} после достижения TP ({current_position_type} позиция) ---")
     
-    # Убедимся, что DataFrame достаточно большой для анализа паттернов
-    if len(df) < max(MACD_SLOW_LENGTH + MACD_SIGNAL_LENGTH, BB_LENGTH, ATR_LENGTH) * 2: # Нужно больше данных для разворота
+    if len(df) < max(MACD_SLOW_LENGTH + MACD_SIGNAL_LENGTH, BB_LENGTH, ATR_LENGTH) * 2:
         logger.warning(f"[{symbol}] Недостаточно данных для надежного анализа разворота. Требуется больше свечей.")
         return
 
-    # Получаем последние N свечей для анализа (например, последние 5-10 свечей)
-    recent_df = df.iloc[-10:] # Можно настроить глубину анализа
-
-    # Получаем индикаторы из последних свечей
     last_candle = df.iloc[-1]
     current_rsi = last_candle[f'RSI_14']
     current_macd_hist = last_candle[f'MACDh_{MACD_FAST_LENGTH}_{MACD_SLOW_LENGTH}_{MACD_SIGNAL_LENGTH}']
@@ -304,55 +305,33 @@ def analyze_reversal_opportunity(symbol, df, current_position_type, current_clos
     reversal_found = False
     suggested_direction = "NONE"
 
-    # --- Пример простой логики разворота (можно значительно усложнить) ---
-
-    # Пример для потенциального SHORT разворота после LONG позиции
     if current_position_type == "LONG":
-        # Условия для медвежьего разворота:
-        # 1. RSI выше 70 и начинает падать (медвежья дивергенция или перекупленность)
-        # 2. MACD гистограмма падает после пика (показывает ослабление бычьего моментума)
-        # 3. Цена около верхней полосы Боллинджера или вышла за нее и вернулась
-        
-        # Простая проверка: RSI > 70 (перекупленность) и MACD гистограмма отрицательная (медвежье пересечение или падение)
-        # Более сложная: поиск медвежьих дивергенций MACD или RSI
-        
         if current_rsi > 70 and current_macd_hist < 0:
             logger.info(f"[{symbol}] **Потенциальный медвежий разворот после LONG позиции:** RSI ({current_rsi:.2f}) > 70 и MACD Hist ({current_macd_hist:.4f}) < 0.")
             reversal_found = True
             suggested_direction = "SHORT"
-        elif current_close_price > current_bb_upper and df.iloc[-2]['close'] < current_bb_upper: # Цена вышла за верхнюю BB и закрылась внутри
+        elif current_close_price > current_bb_upper and df.iloc[-2]['close'] < current_bb_upper:
             logger.info(f"[{symbol}] **Потенциальный медвежий разворот после LONG позиции:** Цена закрылась внутри верхней BB после выхода за нее.")
             reversal_found = True
             suggested_direction = "SHORT"
 
-    # Пример для потенциального LONG разворота после SHORT позиции
     elif current_position_type == "SHORT":
-        # Условия для бычьего разворота:
-        # 1. RSI ниже 30 и начинает расти (бычья дивергенция или перепроданность)
-        # 2. MACD гистограмма растет после впадины (показывает ослабление медвежьего моментума)
-        # 3. Цена около нижней полосы Боллинджера или вышла за нее и вернулась
-
-        # Простая проверка: RSI < 30 (перепроданность) и MACD гистограмма положительная (бычье пересечение или рост)
-        # Более сложная: поиск бычьих дивергенций MACD или RSI
         if current_rsi < 30 and current_macd_hist > 0:
             logger.info(f"[{symbol}] **Потенциальный бычий разворот после SHORT позиции:** RSI ({current_rsi:.2f}) < 30 и MACD Hist ({current_macd_hist:.4f}) > 0.")
             reversal_found = True
             suggested_direction = "LONG"
-        elif current_close_price < current_bb_lower and df.iloc[-2]['close'] > current_bb_lower: # Цена вышла за нижнюю BB и закрылась внутри
+        elif current_close_price < current_bb_lower and df.iloc[-2]['close'] > current_bb_lower:
             logger.info(f"[{symbol}] **Потенциальный бычий разворот после SHORT позиции:** Цена закрылась внутри нижней BB после выхода за нее.")
             reversal_found = True
             suggested_direction = "LONG"
 
     if reversal_found:
         logger.info(f"[{symbol}] Найден **потенциальный сигнал разворота** для входа в {suggested_direction} по цене {current_close_price:.8f}. (Требуется дополнительное подтверждение или ручной анализ).")
-        # Здесь вы можете добавить логику для генерации реального сигнала на торговлю
-        # Например, можно вернуть "REVERSAL_BUY" или "REVERSAL_SELL"
-        # Для демонстрации пока просто логируем.
-        bot_state[symbol]['last_reversal_check_time'] = current_time # Обновляем время последней проверки
+        bot_state[symbol]['last_reversal_check_time'] = current_time
 
     else:
         logger.info(f"[{symbol}] Признаков разворота не обнаружено после достижения TP.")
-        bot_state[symbol]['last_reversal_check_time'] = current_time # Обновляем время последней проверки
+        bot_state[symbol]['last_reversal_check_time'] = current_time
 
 def analyze_data(symbol, df):
     """
@@ -408,10 +387,8 @@ def analyze_data(symbol, df):
         logger.warning(f"[{symbol}]    Close: {current_close_price:.8f}")
         return "WAIT"
 
-    # --- Подробный вывод индикаторов только при наличии сигнала или уже открытой позиции ---
     should_log_details = current_pair_state['bot_in_position']
 
-    # Условия для входа (для определения should_log_details, если нет позиции)
     condition_long_ema_trend = current_ema_50 > current_ema_200
     condition_long_rsi = current_rsi < 70
     condition_long_macd = (current_macd > current_macd_signal) or (current_macd_hist > 0)
@@ -425,7 +402,7 @@ def analyze_data(symbol, df):
     if not current_pair_state['bot_in_position']:
         if (condition_long_ema_trend and condition_long_rsi and condition_long_macd and condition_long_bb) or \
            (condition_short_ema_trend and condition_short_rsi and condition_short_macd and condition_short_bb):
-            should_log_details = True # Условия для входа выполнены, логируем подробно
+            should_log_details = True
 
     if should_log_details:
         logger.info(f"\n--- Анализ для {symbol} на {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (Таймфрейм: {TIMEFRAME}) ---")
@@ -445,7 +422,6 @@ def analyze_data(symbol, df):
             logger.info(f"[{symbol}]    TP3: {current_pair_state['take_profit_prices']['TP3']:.8f} ({"достигнут" if current_pair_state['tp_levels_hit']['TP3'] else "нет"})")
             logger.info(f"[{symbol}]    Текущая цена: {current_close_price:.8f}")
     else:
-        # Краткий вывод, если нет позиции и нет сигнала
         logger.info(f"[{symbol}] Мониторинг. Цена: {current_close_price:.8f}. Без активной позиции и без сигнала.")
 
 
@@ -462,7 +438,7 @@ def analyze_data(symbol, df):
             current_pair_state['last_atr_for_sl_tp'] = current_atr
 
             current_pair_state['stop_loss_price'] = current_pair_state['entry_price'] - (current_pair_state['last_atr_for_sl_tp'] * SL_MULTIPLIER)
-            current_pair_state['original_stop_loss_price'] = current_pair_state['stop_loss_price'] # Сохраняем первоначальный SL
+            current_pair_state['original_stop_loss_price'] = current_pair_state['stop_loss_price']
             current_pair_state['take_profit_prices']['TP1'] = current_pair_state['entry_price'] + (current_pair_state['last_atr_for_sl_tp'] * TP1_MULTIPLIER)
             current_pair_state['take_profit_prices']['TP2'] = current_pair_state['entry_price'] + (current_pair_state['last_atr_for_sl_tp'] * TP2_MULTIPLIER)
             current_pair_state['take_profit_prices']['TP3'] = current_pair_state['entry_price'] + (current_pair_state['last_atr_for_sl_tp'] * TP3_MULTIPLIER)
@@ -491,7 +467,7 @@ def analyze_data(symbol, df):
             current_pair_state['last_atr_for_sl_tp'] = current_atr
 
             current_pair_state['stop_loss_price'] = current_pair_state['entry_price'] + (current_pair_state['last_atr_for_sl_tp'] * SL_MULTIPLIER)
-            current_pair_state['original_stop_loss_price'] = current_pair_state['stop_loss_price'] # Сохраняем первоначальный SL
+            current_pair_state['original_stop_loss_price'] = current_pair_state['stop_loss_price']
             current_pair_state['take_profit_prices']['TP1'] = current_pair_state['entry_price'] - (current_pair_state['last_atr_for_sl_tp'] * TP1_MULTIPLIER)
             current_pair_state['take_profit_prices']['TP2'] = current_pair_state['entry_price'] - (current_pair_state['last_atr_for_sl_tp'] * TP2_MULTIPLIER)
             current_pair_state['take_profit_prices']['TP3'] = current_pair_state['entry_price'] - (current_pair_state['last_atr_for_sl_tp'] * TP3_MULTIPLIER)
@@ -534,15 +510,9 @@ def analyze_data(symbol, df):
 
     else: # Если бот уже в позиции, отслеживаем её и проверяем SL/TP
         
-        # --- Логика Break-Even Stop (закомментирована, чтобы SL не двигался в безубыток) ---
         position_closed = False
 
         if current_pair_state['current_position_type'] == "LONG":
-            # if ENABLE_BREAK_EVEN_STOP and current_pair_state['tp_levels_hit']['TP1'] and current_pair_state['stop_loss_price'] < current_pair_state['entry_price']:
-            #     logger.info(f"[{symbol}]    TP1 достигнут, перевод SL в безубыток: {current_pair_state['entry_price']:.8f}")
-            #     current_pair_state['stop_loss_price'] = current_pair_state['entry_price']
-            #     save_bot_state()
-
             if current_close_price <= current_pair_state['stop_loss_price']:
                 logger.info(f"[{symbol}] **ЗАКРЫТИЕ LONG по СТОП-ЛОССУ:** Цена {current_close_price:.8f} <= SL {current_pair_state['stop_loss_price']:.8f}.")
                 signal = "CLOSE_LONG_SL"
@@ -551,13 +521,14 @@ def analyze_data(symbol, df):
                 if not current_pair_state['tp_levels_hit']['TP3'] and current_close_price >= current_pair_state['take_profit_prices']['TP3']:
                     logger.info(f"[{symbol}] **TP 3 достигнуто (LONG)!** Цена: {current_close_price:.8f}")
                     current_pair_state['tp_levels_hit']['TP3'] = True
-                    signal = "PARTIAL_CLOSE_LONG_TP3"
-                    analyze_reversal_opportunity(symbol, df, current_pair_state['current_position_type'], current_close_price) # Вызов функции разворота
+                    signal = "PARTIAL_CLOSE_LONG_TP3" 
+                    position_closed = True
+                    analyze_reversal_opportunity(symbol, df, current_pair_state['current_position_type'], current_close_price)
                 elif not current_pair_state['tp_levels_hit']['TP2'] and current_close_price >= current_pair_state['take_profit_prices']['TP2']:
                     logger.info(f"[{symbol}] **TP 2 достигнуто (LONG)!** Цена: {current_close_price:.8f}")
                     current_pair_state['tp_levels_hit']['TP2'] = True
                     signal = "PARTIAL_CLOSE_LONG_TP2"
-                    analyze_reversal_opportunity(symbol, df, current_pair_state['current_position_type'], current_close_price) # Вызов функции разворота
+                    analyze_reversal_opportunity(symbol, df, current_pair_state['current_position_type'], current_close_price)
                 elif not current_pair_state['tp_levels_hit']['TP1'] and current_close_price >= current_pair_state['take_profit_prices']['TP1']:
                     logger.info(f"[{symbol}] **TP 1 достигнуто (LONG)!** Цена: {current_close_price:.8f}")
                     current_pair_state['tp_levels_hit']['TP1'] = True
@@ -566,11 +537,6 @@ def analyze_data(symbol, df):
                     logger.info(f"[{symbol}]    Позиция LONG удерживается.")
 
         elif current_pair_state['current_position_type'] == "SHORT":
-            # if ENABLE_BREAK_EVEN_STOP and current_pair_state['tp_levels_hit']['TP1'] and current_pair_state['stop_loss_price'] > current_pair_state['entry_price']:
-            #     logger.info(f"[{symbol}]    TP1 достигнут, перевод SL в безубыток: {current_pair_state['entry_price']:.8f}")
-            #     current_pair_state['stop_loss_price'] = current_pair_state['entry_price']
-            #     save_bot_state()
-
             if current_close_price >= current_pair_state['stop_loss_price']:
                 logger.info(f"[{symbol}] **ЗАКРЫТИЕ SHORT по СТОП-ЛОССУ:** Цена {current_close_price:.8f} >= SL {current_pair_state['stop_loss_price']:.8f}.")
                 signal = "CLOSE_SHORT_SL"
@@ -580,12 +546,13 @@ def analyze_data(symbol, df):
                     logger.info(f"[{symbol}] **TP 3 достигнуто (SHORT)!** Цена: {current_close_price:.8f}")
                     current_pair_state['tp_levels_hit']['TP3'] = True
                     signal = "PARTIAL_CLOSE_SHORT_TP3"
-                    analyze_reversal_opportunity(symbol, df, current_pair_state['current_position_type'], current_close_price) # Вызов функции разворота
+                    position_closed = True
+                    analyze_reversal_opportunity(symbol, df, current_pair_state['current_position_type'], current_close_price)
                 elif not current_pair_state['tp_levels_hit']['TP2'] and current_close_price <= current_pair_state['take_profit_prices']['TP2']:
                     logger.info(f"[{symbol}] **TP 2 достигнуто (SHORT)!** Цена: {current_close_price:.8f}")
                     current_pair_state['tp_levels_hit']['TP2'] = True
                     signal = "PARTIAL_CLOSE_SHORT_TP2"
-                    analyze_reversal_opportunity(symbol, df, current_pair_state['current_position_type'], current_close_price) # Вызов функции разворота
+                    analyze_reversal_opportunity(symbol, df, current_pair_state['current_position_type'], current_close_price)
                 elif not current_pair_state['tp_levels_hit']['TP1'] and current_close_price <= current_pair_state['take_profit_prices']['TP1']:
                     logger.info(f"[{symbol}] **TP 1 достигнуто (SHORT)!** Цена: {current_close_price:.8f}")
                     current_pair_state['tp_levels_hit']['TP1'] = True
@@ -594,6 +561,8 @@ def analyze_data(symbol, df):
                     logger.info(f"[{symbol}]    Позиция SHORT удерживается.")
 
         if position_closed:
+            closing_reason = "SL" if "SL" in signal else "TP3"
+            logger.info(f"[{symbol}] **Полное закрытие позиции по {closing_reason}!** Состояние сброшено, поиск новой позиции.")
             bot_state[symbol] = initialize_pair_state(symbol)
             save_bot_state()
 
@@ -606,9 +575,7 @@ if __name__ == "__main__":
 
     logger.setLevel(logging.INFO)
 
-    # 1. Сначала загружаем конфигурацию
     load_config()
-    # 2. Затем загружаем состояние бота, используя символы из загруженной конфигурации
     load_bot_state()
 
     try:
